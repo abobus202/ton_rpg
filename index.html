@@ -157,6 +157,62 @@
     line-height: 1.6;
     font-style: italic;
   }
+  .inventory-section {
+    margin-top: 24px;
+    background: linear-gradient(160deg, var(--panel), var(--bg2));
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px;
+  }
+  .inv-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .inv-title {
+    font-family: 'Cinzel', serif;
+    font-weight: 700;
+    font-size: 18px;
+    color: var(--gold-bright);
+  }
+  .inv-refresh {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--gold);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-family: 'Spectral', serif;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .inv-refresh:active { background: var(--bg2); }
+  .inv-group-title {
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin: 12px 0 8px;
+  }
+  .inv-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 6px;
+  }
+  .inv-item .ic { font-size: 20px; }
+  .inv-item .nm { color: var(--parchment); font-size: 14px; }
+  .inv-empty {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 13px;
+    text-align: center;
+    padding: 12px;
+  }
 </style>
 </head>
 <body>
@@ -185,6 +241,16 @@
 
   <div id="status">Подключи кошелёк, чтобы открывать боксы.</div>
 
+  <div class="inventory-section">
+    <div class="inv-header">
+      <span class="inv-title">Инвентарь</span>
+      <button id="refresh-inv" class="inv-refresh">Обновить</button>
+    </div>
+    <div id="inventory-body">
+      <div class="inv-empty">Загрузка...</div>
+    </div>
+  </div>
+
   <div class="hint">
     Платёж идёт на смарт-контракт в сети TON.<br>
     После подтверждения сервер откроет бокс и выдаст награду.
@@ -200,6 +266,9 @@ const BOX_PRICE_TON = 0.1;
 const MANIFEST_URL = "https://abobus202.github.io/ton_rpg/tonconnect-manifest.json";
 // opcode сообщения BuyItem из контракта (header 3725398372).
 const BUYITEM_OPCODE = 0xDE0D1164;
+// Адрес твоего API-бэкенда. Для локального теста — публичный URL от ngrok.
+// ВАЖНО: замени на свой адрес (см. инструкцию). Без / в конце.
+const API_BASE = "PASTE_YOUR_API_URL_HERE";
 // ==================================
 
 // Telegram: разворачиваем на весь экран, берём user.id.
@@ -338,6 +407,9 @@ async function buyBox(itemTag) {
 
     setStatus("Оплата отправлена! Сервер открывает бокс — награда появится через несколько секунд.", "ok");
     if (tg) tg.HapticFeedback?.notificationOccurred?.("success");
+    // Через 8 сек подтянем инвентарь — к этому моменту слушатель обычно
+    // уже обработал платёж и выдал предмет.
+    setTimeout(loadInventory, 8000);
   } catch (e) {
     console.error(e);
     setStatus("Транзакция отменена или не прошла.", "err");
@@ -347,6 +419,67 @@ async function buyBox(itemTag) {
 buyButtons.forEach(btn => {
   btn.addEventListener("click", () => buyBox(btn.dataset.tag));
 });
+
+// ---- Инвентарь: запрос к API ----
+const invBody = document.getElementById("inventory-body");
+
+function renderInventory(data) {
+  if (!data || data.total === 0) {
+    invBody.innerHTML = '<div class="inv-empty">Пока пусто. Открой бокс!</div>';
+    return;
+  }
+  let html = "";
+  if (data.characters.length) {
+    html += '<div class="inv-group-title">Персонажи</div>';
+    for (const c of data.characters) {
+      html += '<div class="inv-item"><span class="ic">⚔️</span><span class="nm">'
+        + escapeHtml(c.item_name) + '</span></div>';
+    }
+  }
+  if (data.buildings.length) {
+    html += '<div class="inv-group-title">Здания</div>';
+    for (const b of data.buildings) {
+      html += '<div class="inv-item"><span class="ic">🏰</span><span class="nm">'
+        + escapeHtml(b.item_name) + '</span></div>';
+    }
+  }
+  invBody.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function loadInventory() {
+  if (!API_BASE || API_BASE.startsWith("PASTE_")) {
+    invBody.innerHTML = '<div class="inv-empty">API не настроен.</div>';
+    return;
+  }
+  const initData = tg?.initData || "";
+  if (!initData) {
+    invBody.innerHTML = '<div class="inv-empty">Открой приложение внутри Telegram.</div>';
+    return;
+  }
+  try {
+    const resp = await fetch(API_BASE + "/inventory", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initData }),
+    });
+    if (!resp.ok) {
+      invBody.innerHTML = '<div class="inv-empty">Не удалось загрузить (' + resp.status + ').</div>';
+      return;
+    }
+    renderInventory(await resp.json());
+  } catch (e) {
+    console.error(e);
+    invBody.innerHTML = '<div class="inv-empty">Ошибка связи с сервером.</div>';
+  }
+}
+
+document.getElementById("refresh-inv").addEventListener("click", loadInventory);
+loadInventory();
 </script>
 </body>
 </html>
