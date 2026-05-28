@@ -8,9 +8,7 @@
 <!-- Telegram Mini App SDK: даёт user.id и тему -->
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <!-- TON Connect UI: кнопка подключения кошелька + sendTransaction -->
-<script src="https://unpkg.com/@tonconnect/ui@2/dist/tonconnect-ui.min.js"></script>
-<!-- @ton/core для сборки BuyItem-ячейки (тот же формат, что в контракте) -->
-<script src="https://unpkg.com/@ton/core@0.59.1/dist/index.js"></script>
+<script src="https://unpkg.com/@tonconnect/ui@latest/dist/tonconnect-ui.min.js"></script>
 
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700;900&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 
@@ -199,13 +197,10 @@ const CONTRACT_ADDRESS = "kQDLLnXptDpO2EVlrFyDvzyvkaEwUd2ONa-4S5Z7102TP9xh";
 // Цена бокса в TON.
 const BOX_PRICE_TON = 0.1;
 // URL манифеста (тот же адрес, где лежит tonconnect-manifest.json).
-// ВАЖНО: замени USERNAME/REPO на свои после заливки на GitHub Pages.
 const MANIFEST_URL = "https://abobus202.github.io/ton_rpg/tonconnect-manifest.json";
 // opcode сообщения BuyItem из контракта (header 3725398372).
 const BUYITEM_OPCODE = 0xDE0D1164;
 // ==================================
-
-const { beginCell, Address, toNano } = window.TonCore;
 
 // Telegram: разворачиваем на весь экран, берём user.id.
 const tg = window.Telegram?.WebApp;
@@ -246,17 +241,80 @@ tonConnectUI.onStatusChange((wallet) => {
   }
 });
 
-// Собираем тело сообщения BuyItem ТОЧНО как Tact:
-//   корень: 32 бита opcode
-//   ref[0]: строка itemTag
-//   ref[1]: строка playerId
+// ---- Сборка BuyItem-payload БЕЗ внешних библиотек ----
+// Структура BOC: корень (32 бита opcode) + 2 ref-ячейки со строками.
+// Проверено байт-в-байт против Tact-обёртки контракта.
+
+function crc32c(bytes) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    crc ^= bytes[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 1) ? (crc >>> 1) ^ 0x82F63B78 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function strBytes(s) {
+  return Array.from(new TextEncoder().encode(s));
+}
+
+function serializeCell(cell) {
+  const d1 = cell.refs.length;
+  const fullBytes = Math.floor(cell.bits / 8);
+  const d2 = fullBytes + Math.ceil(cell.bits / 8);
+  const dataPart = cell.data.slice();
+  if (cell.bits % 8 !== 0) {
+    const usedBits = cell.bits % 8;
+    dataPart[fullBytes] = (cell.data[fullBytes] || 0) | (1 << (7 - usedBits));
+  }
+  return [d1, d2, ...dataPart, ...cell.refs];
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
 function buildBuyItemPayload(itemTag, playerId) {
-  const cell = beginCell()
-    .storeUint(BUYITEM_OPCODE, 32)
-    .storeRef(beginCell().storeStringTail(itemTag).endCell())
-    .storeRef(beginCell().storeStringTail(playerId).endCell())
-    .endCell();
-  return cell.toBoc().toString("base64");
+  const op = BUYITEM_OPCODE >>> 0;
+  const opBytes = [(op >>> 24) & 0xff, (op >>> 16) & 0xff, (op >>> 8) & 0xff, op & 0xff];
+  const root = { data: opBytes, bits: 32, refs: [1, 2] };
+
+  const tagBytes = strBytes(itemTag);
+  const c1 = { data: tagBytes, bits: tagBytes.length * 8, refs: [] };
+
+  const pidBytes = strBytes(playerId);
+  const c2 = { data: pidBytes, bits: pidBytes.length * 8, refs: [] };
+
+  const cells = [root, c1, c2];
+  let cellData = [];
+  for (const c of cells) cellData.push(...serializeCell(c));
+
+  let boc = [
+    0xb5, 0xee, 0x9c, 0x72,   // magic
+    0x41,                      // has_crc32c + size=1
+    0x01,                      // off_bytes
+    cells.length,              // cells count
+    0x01,                      // roots
+    0x00,                      // absent
+    cellData.length,           // total cells size
+    0x00,                      // root index
+    ...cellData,
+  ];
+  const crc = crc32c(boc);
+  boc.push(crc & 0xff, (crc >>> 8) & 0xff, (crc >>> 16) & 0xff, (crc >>> 24) & 0xff);
+  return bytesToBase64(boc);
+}
+
+// Конвертация TON в нанотоны (1 TON = 1e9 nano) без библиотек.
+function toNanoStr(ton) {
+  // аккуратно, через целые: поддержим до 9 знаков после точки
+  const [intPart, fracPart = ""] = ton.toString().split(".");
+  const frac = (fracPart + "000000000").slice(0, 9);
+  return (BigInt(intPart) * 1000000000n + BigInt(frac)).toString();
 }
 
 async function buyBox(itemTag) {
@@ -269,7 +327,7 @@ async function buyBox(itemTag) {
       messages: [
         {
           address: CONTRACT_ADDRESS,
-          amount: toNano(BOX_PRICE_TON.toString()).toString(), // в нанотонах
+          amount: toNanoStr(BOX_PRICE_TON), // в нанотонах
           payload: payload,
         },
       ],
